@@ -5,7 +5,7 @@
 #include <QTranslator>
 #include "logger.h"
 #include <WinSock2.h>
-
+#include "sqlconnectionpool.h"
 int main(int argc, char *argv[])
 {
 #ifdef _WIN32
@@ -15,6 +15,7 @@ int main(int argc, char *argv[])
         Logger::getInstance().Log("WSAStartup failed : " + std::to_string(wsaRet));
     }
 #endif
+    SqlConnectionPool::instance().init(30);
     QApplication a(argc, argv);
 
     QTranslator translator;
