@@ -86,7 +86,12 @@ void SocketClient::receiveData(SOCKET sock) {
                 int len = std::min(result, static_cast<int>(sizeof(buffer) - 1));
                 buffer[len] = '\0';
                 QByteArray ba(buffer, result);
-                emit dataReceived(ba);
+                if(onRawData){              //设置回调后, 走回调
+                    onRawData(ba);
+                }else{
+                    emit dataReceived(ba);
+                }
+
             }
             else if (result == 0) {
                 // Logger::getInstance().Log("---- [Error] IP: [" + ipAddress + "]. Port: [" + std::to_string(mPort) + "]. Socket disconnected!");

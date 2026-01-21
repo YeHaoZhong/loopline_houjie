@@ -20,7 +20,13 @@ struct PendingInfo {
     QDateTime ts;   // 请求时间，用于超时
     QNetworkReply* reply; // optional, for correlation
 };
-using ReqItem = QPair<QNetworkRequest, QByteArray>;
+struct ReqItem
+{
+    QNetworkRequest req;
+    QByteArray payload;
+    QString reqTag;
+    int retriesLeft;
+};
 
 class JTRequest :public QObject
 {
@@ -77,10 +83,10 @@ private:
 private slots:
     void onNetworkFinished(QNetworkReply* reply);
     void checkPendingTimeouts();
-    void requestTerminalCode(const QString& Code);	//请求三段码
+    void requestTerminalCode(const QString& Code);                      //请求三段码
     void requestUploadData(const QString& Code, const QString& weight);	//四合一扫描,补收入发 集散点
-    void requestBuild(const QString& packageNum);	//建包接口,所有数据从数据库拿
-    void requestSmallData(const QString& code);		//小件回传数据
+    void requestBuild(const QString& packageNum);                       //建包接口,所有数据从数据库拿
+    void requestSmallData(const QString& code);                         //小件回传数据
 
 signals:
     void loginSucceeded();

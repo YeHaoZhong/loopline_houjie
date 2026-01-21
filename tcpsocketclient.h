@@ -5,6 +5,7 @@
 #include<thread>
 #include<QObject>
 #include <atomic>
+#include <functional>
 class SocketClient :public QObject {
 
     Q_OBJECT
@@ -16,7 +17,7 @@ public:
     bool connectStatus(const std::string& text);
     void disconnect();
     bool SocketConnection = false;
-
+    std::function<void(const QByteArray& data)> onRawData;
 public slots:
 
     bool sendComand(const QByteArray& command) {

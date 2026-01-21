@@ -26,17 +26,20 @@ JTRequest::JTRequest(QObject* parent)
 JTRequest::~JTRequest()
 {
     timeoutTimer.stop();
-    for (auto it = m_pending.begin(); it != m_pending.end(); ++it)
+    QList<QNetworkReply*> pendingReplies;
     {
-        QNetworkReply* r = it.key();
-        if (r)
-        {
-            disconnect(r, nullptr, this, nullptr);
-            r->abort();
-            r->deleteLater();
+        QMutexLocker l(&m_mutex);
+        for (auto it = m_pending.begin(); it != m_pending.end(); ++it) {
+            pendingReplies.append(it.key());
         }
+        m_pending.clear();
     }
-    m_pending.clear();
+    for (QNetworkReply* r : pendingReplies) {
+        if (!r) continue;
+        disconnect(r, nullptr, this, nullptr);
+        r->abort();
+        r->deleteLater();
+    }
 }
 void JTRequest::attachAuthHeader(QNetworkRequest& req) const
 {
@@ -90,44 +93,86 @@ void JTRequest::dbInit()
         m_password = QString::fromStdString(*password);
     }
 }
+// void JTRequest::enqueueOrSend(const QNetworkRequest& req, const QByteArray& payload, const QString& reqTag, int maxRetries, bool bypassPause)
+// {
+//     if (m_refreshingToken.load() && !bypassPause)
+//     {
+//         QMutexLocker pl(&m_pausedMutex);
+//         m_pausedRequests.enqueue(qMakePair(req, payload));
+//         debugLog(QString("----[JTRequest] enqueueOrSend() Paused request while refreshing token: %1").arg(req.url().toString()));
+//         return;
+//     }
+//     QMutexLocker l(&m_mutex);
+//     if (m_requestQueue.size() > maxQueueSize) {
+//         log("----[JTRequest] enqueueOrSend() Request queue full, rejecting request");
+//         emit requestFailed(QString::fromUtf8(req.url().toString().toUtf8()), "queue full");
+//         return;
+//     }
+//     // 如果当前并发未达上限，直接发送
+//     if (m_pending.size() < concurrencyLimit) {
+//         // we will post immediately
+//         QNetworkReply* reply = m_netMgr->post(req, payload);
+//         if (reply) {
+//             QVariantMap hmap;
+//             for (const QByteArray& hk : req.rawHeaderList())
+//             {
+//                 hmap.insert(QString::fromUtf8(hk), QString::fromUtf8(req.rawHeader(hk)));
+//             }
+//             reply->setProperty("origHeaders", hmap);
+//             reply->setProperty("reqTag", reqTag);
+//             reply->setProperty("retriesLeft", maxRetries);
+//             reply->setProperty("payload", payload);
+//             reply->setProperty("reqUrl", req.url().toString());
+//             m_pending.insert(reply, QDateTime::currentMSecsSinceEpoch());
+//             log("----[JTRequest] enqueueOrSend() Sent request immediate: " + req.url().toString().toStdString() + ", tag = " + reqTag.toStdString());
+//         }
+//     }
+//     else {
+//         // enqueue
+//         m_requestQueue.enqueue(qMakePair(req, payload));
+//         log("----[JTRequest] enqueueOrSend() Enqueued request: " + req.url().toString().toStdString() + ", tag = " + reqTag.toStdString() + " (queue size=" + std::to_string(m_requestQueue.size()) + ")");
+//     }
+// }
 void JTRequest::enqueueOrSend(const QNetworkRequest& req, const QByteArray& payload, const QString& reqTag, int maxRetries, bool bypassPause)
 {
-    if (m_refreshingToken.load() && !bypassPause)
+    // 为了避免在锁内进行网络 I/O，先决定是否应该立即发出
+    bool shouldSend = false;
     {
-        QMutexLocker pl(&m_pausedMutex);
-        m_pausedRequests.enqueue(qMakePair(req, payload));
-        debugLog(QString("----[JTRequest] enqueueOrSend() Paused request while refreshing token: %1").arg(req.url().toString()));
-        return;
-    }
-    QMutexLocker l(&m_mutex);
-    if (m_requestQueue.size() > maxQueueSize) {
-        log("----[JTRequest] enqueueOrSend() Request queue full, rejecting request");
-        emit requestFailed(QString::fromUtf8(req.url().toString().toUtf8()), "queue full");
-        return;
-    }
-    // 如果当前并发未达上限，直接发送
-    if (m_pending.size() < concurrencyLimit) {
-        // we will post immediately
-        QNetworkReply* reply = m_netMgr->post(req, payload);
-        if (reply) {
-            QVariantMap hmap;
-            for (const QByteArray& hk : req.rawHeaderList())
-            {
-                hmap.insert(QString::fromUtf8(hk), QString::fromUtf8(req.rawHeader(hk)));
+        QMutexLocker l(&m_mutex);
+        if (m_pending.size() >= concurrencyLimit) {
+            if (m_requestQueue.size() < maxQueueSize) {
+                ReqItem it{req,payload,reqTag,maxRetries};
+                m_requestQueue.enqueue(it);
+                log("---- [加入请求] 地址:[" + req.url().toString().toStdString() + "], 队列中数量:[" + std::to_string(m_requestQueue.size()) + "]");
+            } else {
+                log("---- [加入请求] 队列已满，正在丢弃请求: [" + req.url().toString().toStdString() + "]");
             }
-            reply->setProperty("origHeaders", hmap);
-            reply->setProperty("reqTag", reqTag);
-            reply->setProperty("retriesLeft", maxRetries);
-            reply->setProperty("payload", payload);
-            reply->setProperty("reqUrl", req.url().toString());
-            m_pending.insert(reply, QDateTime::currentMSecsSinceEpoch());
-            log("----[JTRequest] enqueueOrSend() Sent request immediate: " + req.url().toString().toStdString() + ", tag = " + reqTag.toStdString());
+        } else {
+            // 有并发位置，准备直接发送
+            shouldSend = true;
         }
     }
-    else {
-        // enqueue
-        m_requestQueue.enqueue(qMakePair(req, payload));
-        log("----[JTRequest] enqueueOrSend() Enqueued request: " + req.url().toString().toStdString() + ", tag = " + reqTag.toStdString() + " (queue size=" + std::to_string(m_requestQueue.size()) + ")");
+
+    if (!shouldSend) return;
+
+    // 发送必须在锁外进行（避免阻塞其他线程）
+    QNetworkReply* reply = m_netMgr->post(req, payload);
+    if (reply) {
+        QVariantMap hmap;
+        for (const QByteArray& hk : req.rawHeaderList())
+            hmap.insert(QString::fromUtf8(hk), QString::fromUtf8(req.rawHeader(hk)));
+
+        reply->setProperty("origHeaders", hmap);
+        reply->setProperty("retriesLeft", maxRetries);
+        reply->setProperty("reqTag", reqTag);
+        reply->setProperty("payload", payload);
+        reply->setProperty("reqUrl", req.url().toString());
+        // 插入 pending 要加锁
+        {
+            QMutexLocker l(&m_mutex);
+            m_pending.insert(reply, QDateTime::currentMSecsSinceEpoch());
+        }
+        log("---- [发送请求] 立即请求地址: [" + req.url().toString().toStdString() + "]");
     }
 }
 //签名
@@ -146,48 +191,117 @@ QByteArray JTRequest::computeSignatureMd5Base64(const QString& appSecret, const 
 
     return signatureBase64;
 }
+// void JTRequest::checkPendingTimeouts()
+// {
+//     qint64 now = QDateTime::currentMSecsSinceEpoch();
+//     QList<QNetworkReply*> toAbort;
+//     { // lock scope
+//         QMutexLocker l(&m_mutex);
+//         for (auto it = m_pending.begin(); it != m_pending.end(); ++it) {
+//             qint64 start = it.value();
+//             if (now - start > requestTimeoutMs) {
+//                 toAbort.append(it.key());
+//             }
+//         }
+//     }
+
+//     for (QNetworkReply* r : toAbort) {
+//         if (!r) continue;
+//         debugLog(QString("----[JTRequest] checkPendingTimeouts() Aborting timed-out request: %1").arg(r->property("reqUrl").toString()));
+//         r->abort();
+//     }
+// }
 void JTRequest::checkPendingTimeouts()
 {
-    qint64 now = QDateTime::currentMSecsSinceEpoch();
-    QList<QNetworkReply*> toAbort;
-    { // lock scope
-        QMutexLocker l(&m_mutex);
-        for (auto it = m_pending.begin(); it != m_pending.end(); ++it) {
-            qint64 start = it.value();
-            if (now - start > requestTimeoutMs) {
-                toAbort.append(it.key());
+    try {
+        qint64 now = QDateTime::currentMSecsSinceEpoch();
+        QList<QNetworkReply*> toAbort;
+
+        { // 把超时的 reply 从 pending 中移出到本地列表（避免重复 abort）
+            QMutexLocker l(&m_mutex);
+            for (auto it = m_pending.begin(); it != m_pending.end(); ) {
+                qint64 start = it.value();
+                QNetworkReply* r = it.key();
+                if (now - start > requestTimeoutMs) {
+                    toAbort.append(r);
+                    it = m_pending.erase(it); // 立即从 pending 中移除
+                } else {
+                    ++it;
+                }
             }
         }
-    }
 
-    for (QNetworkReply* r : toAbort) {
-        if (!r) continue;
-        debugLog(QString("----[JTRequest] checkPendingTimeouts() Aborting timed-out request: %1").arg(r->property("reqUrl").toString()));
-        r->abort();
+        for (QNetworkReply* r : toAbort) {
+            if (!r) continue;
+            log("---- [请求中止] 正在中止已超时的请求接口: [" + r->property("reqUrl").toString().toStdString() + "]");
+            // 标记为 timeoutAbort，后续 finished 时会特别处理（不立即重试）
+            r->setProperty("timeoutAbort", true);
+            r->abort();
+        }
+    } catch (const std::exception& e) {
+        log("---- [检查超时] 请求超时异常: " + std::string(e.what()));
     }
 }
+// void JTRequest::tryStartNext()
+// {
+//     QMutexLocker l(&m_mutex);
+//     while (!m_requestQueue.isEmpty() && m_pending.size() < concurrencyLimit) {
+//         auto item = m_requestQueue.dequeue();
+//         QNetworkRequest req = item.first;
+
+//         QByteArray payload = item.second;
+//         QNetworkReply* reply = m_netMgr->post(req, payload);
+//         if (reply) {
+//             QVariantMap hmap;
+//             for (const QByteArray& hk : req.rawHeaderList())
+//             {
+//                 hmap.insert(QString::fromUtf8(hk), QString::fromUtf8(req.rawHeader(hk)));
+//             }
+//             reply->setProperty("origHeaders", hmap);
+//             reply->setProperty("retriesLeft", /*合适的重试次数，比如*/ 3);
+//             reply->setProperty("reqTag", "queued");                                                             //需要重新设置队列中的应该如何处理标签
+//             reply->setProperty("payload", payload);
+//             reply->setProperty("reqUrl", req.url().toString());
+//             m_pending.insert(reply, QDateTime::currentMSecsSinceEpoch());
+//             debugLog(QString("----[JTRequest] tryStartNext() Dequeued and sent request: %1").arg(req.url().toString()));
+//         }
+//     }
+// }
 void JTRequest::tryStartNext()
 {
-    QMutexLocker l(&m_mutex);
-    while (!m_requestQueue.isEmpty() && m_pending.size() < concurrencyLimit) {
-        auto item = m_requestQueue.dequeue();
-        QNetworkRequest req = item.first;
+    // 我们要在锁外 post，所以每次只 dequeue 一个 item 并在锁外发送
+    while (true) {
+        ReqItem item;
+        {
+            QMutexLocker l(&m_mutex);
+            if (m_requestQueue.isEmpty() || m_pending.size() >= concurrencyLimit) {
+                return;
+            }
+            item = m_requestQueue.dequeue();
+        }
 
-        QByteArray payload = item.second;
+        QNetworkRequest req = item.req;
+        QByteArray payload = item.payload;
+        QString reqTag = item.reqTag;
+        int retries = item.retriesLeft;
+
         QNetworkReply* reply = m_netMgr->post(req, payload);
         if (reply) {
             QVariantMap hmap;
-            for (const QByteArray& hk : req.rawHeaderList())
-            {
+            for (const QByteArray& hk : req.rawHeaderList()) {
                 hmap.insert(QString::fromUtf8(hk), QString::fromUtf8(req.rawHeader(hk)));
             }
             reply->setProperty("origHeaders", hmap);
-            reply->setProperty("retriesLeft", /*合适的重试次数，比如*/ 3);
-            reply->setProperty("reqTag", "queued");
+            // 从队列中出来的任务，默认重试次数设为 3（或者根据你的策略）
+            reply->setProperty("retriesLeft", retries);
+            reply->setProperty("reqTag", reqTag);                                                               //标签强制需要重新设置
             reply->setProperty("payload", payload);
             reply->setProperty("reqUrl", req.url().toString());
-            m_pending.insert(reply, QDateTime::currentMSecsSinceEpoch());
-            debugLog(QString("----[JTRequest] tryStartNext() Dequeued and sent request: %1").arg(req.url().toString()));
+            {
+                QMutexLocker l(&m_mutex);
+                m_pending.insert(reply, QDateTime::currentMSecsSinceEpoch());
+            }
+            log("---- [发出请求] 已出列并发送请求: [" + req.url().toString().toStdString() + "]");
         }
     }
 }
@@ -216,50 +330,52 @@ void JTRequest::onNetworkFinished(QNetworkReply* reply) //所有的回调
     }
 
     // ---------- 1) 网络错误 / abort 处理（先于读取数据）
+    bool isTimeoutAbort = reply->property("timeoutAbort").toBool();
     if (netErr != QNetworkReply::NoError) {
         debugLog(QString("----[JTRequest] onNetworkFinished() Network error for %1: code=%2 msg=%3").arg(reqUrl).arg((int)netErr).arg(reply->errorString()));
 
         int retriesLeft = reply->property("retriesLeft").toInt();
+        if (isTimeoutAbort) {
+            reply->deleteLater();
+
+            if (retriesLeft > 0) {
+                // 延迟重试 1s（避免立即自激），重试走 enqueueOrSend（受并发和队列控制）
+                QNetworkRequest newReq(reply->url());
+                QVariantMap origHeaders = reply->property("origHeaders").toMap();
+                if (!origHeaders.isEmpty()) {
+                    for (auto it = origHeaders.begin(); it != origHeaders.end(); ++it) {
+                        newReq.setRawHeader(it.key().toUtf8(), it.value().toString().toUtf8());
+                    }
+                }
+                QByteArray payload = reply->property("payload").toByteArray();
+                QString reqTagLocal = reqTag;
+                int nextRetries = retriesLeft - 1;
+                QTimer::singleShot(1000, this, [this, newReq, payload, reqTagLocal, nextRetries]() {
+                    enqueueOrSend(newReq, payload, reqTagLocal, nextRetries);
+                    // 尝试启动（enqueueOrSend 可能已直接发送）
+                    tryStartNext();
+                });
+            } else {
+                emit requestFailed(reqUrl, "请求超时并已耗尽重试次数");
+            }
+            return;
+        }
         if (retriesLeft > 0) {
-            // 从 reply property 恢复原始 headers（如果有），以便重试时保持一致
-            QVariantMap origHeaders = reply->property("origHeaders").toMap();
             QNetworkRequest newReq(reply->url());
+            QVariantMap origHeaders = reply->property("origHeaders").toMap();
             if (!origHeaders.isEmpty()) {
                 for (auto it = origHeaders.begin(); it != origHeaders.end(); ++it) {
                     newReq.setRawHeader(it.key().toUtf8(), it.value().toString().toUtf8());
                 }
             }
-            else {
-                // fallback：如果没有 origHeaders，则至少恢复授权头
-                attachAuthHeader(newReq);
-            }
-
             QByteArray payload = reply->property("payload").toByteArray();
             reply->deleteLater();
 
-            // 直接重发（注意设置 properties）
-            QNetworkReply* newr = m_netMgr->post(newReq, payload);
-            if (newr) {
-                // 把原始 headers 也写回到新 reply（便于后续重试/保留信息）
-                QVariantMap hmap;
-                for (const QByteArray& hk : newReq.rawHeaderList()) {
-                    hmap.insert(QString::fromUtf8(hk), QString::fromUtf8(newReq.rawHeader(hk)));
-                }
-                newr->setProperty("origHeaders", hmap);
-
-                newr->setProperty("reqTag", reqTag);
-                newr->setProperty("payload", payload);
-                newr->setProperty("reqUrl", newReq.url().toString());
-                newr->setProperty("retriesLeft", retriesLeft - 1);
-
-                QMutexLocker l(&m_mutex);
-                m_pending.insert(newr, QDateTime::currentMSecsSinceEpoch());
-            }
-            else {
-                emit requestFailed(reqUrl, "retry post failed");
-            }
-        }
-        else {
+            // 立即把重试任务入队（enqueueOrSend 会根据并发决定是否立刻发送）
+            enqueueOrSend(newReq, payload, reqTag, retriesLeft - 1);
+            // 尝试发出队列中的下一个（如果空位）
+            tryStartNext();
+        } else {
             emit requestFailed(reqUrl, reply->errorString());
             reply->deleteLater();
             tryStartNext();
@@ -267,7 +383,7 @@ void JTRequest::onNetworkFinished(QNetworkReply* reply) //所有的回调
         return;
     }
 
-    // ---------- 2) 正常情况下再读取数据（reply 没被 abort）
+    // ---------- 2) 正常情况下再读取数据（reply 没被 abort） 成功路径
     QByteArray data = reply->readAll();
 
     // ---------- 3) 解析 JSON
@@ -354,13 +470,17 @@ void JTRequest::onNetworkFinished(QNetworkReply* reply) //所有的回调
                 }
                 // 登录成功，停止刷新标志，并把 paused 请求放回主队列（并发控制会在 tryStartNext 处理）
                 m_refreshingToken.store(false);
-
                 {
                     QMutexLocker pl(&m_pausedMutex);
                     while (!m_pausedRequests.isEmpty()) {
                         auto p = m_pausedRequests.dequeue();
+                        ReqItem _item;
+                        _item.payload = p.second;
+                        _item.req = p.first;
+                        _item.reqTag = "login";
+                        _item.retriesLeft = 3;
                         // 这些请求已经带了 X-Retried-After-Refresh 标记（如果本函数入队时设置了）
-                        m_requestQueue.enqueue(p);
+                        m_requestQueue.enqueue(_item);
                     }
                 }
                 tryStartNext();
@@ -632,9 +752,6 @@ void JTRequest::requestTerminalCode(const QString& Code)    //请求一段码
     //debugLog(QString("requestTerminalCode -> URL: %1").arg(url.toString()));
     //debugLog(QString("requestTerminalCode -> Payload: %1").arg(QString::fromUtf8(payload)));
 
-    //test
-    /*emit slotResult("JT3135044400584", 130);*/
-
     enqueueOrSend(req, payload, "get_terminalCode", 5);
 }
 
@@ -765,7 +882,7 @@ void JTRequest::requestBuild(const QString& packageNum)
     // 这里使用 reqTag = "build" 以便在 onNetworkFinished 中区分处理
     enqueueOrSend(req, payload, "build", 3);
 }
-void JTRequest::requestSmallData(const QString& code) {
+void JTRequest::requestSmallData(const QString& code) {                                 //小件回传
     QString time_mill = QString::fromStdString(std::to_string(currentTimeMillis()));
     // 单条数据对象
     QJsonObject item;

@@ -2,7 +2,7 @@
 #define LOOPLINE_HOUJIE_H
 
 #include <QWidget>
-
+#include "dataprocess.h"
 QT_BEGIN_NAMESPACE
 namespace Ui {
 class loopline_houjie;
@@ -19,5 +19,11 @@ public:
 
 private:
     Ui::loopline_houjie *ui;
+    DataProcess m_dataProcess;
+
+private slots:
+    void onRunBtnClicked();
+    void onStopBtnClicked();
+
 };
 #endif // LOOPLINE_HOUJIE_H
