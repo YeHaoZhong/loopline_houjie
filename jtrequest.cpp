@@ -673,6 +673,14 @@ void JTRequest::onNetworkFinished(QNetworkReply* reply) //所有的回调
         tryStartNext();
         return;
     }
+    if(reqTag == "smallItem"){                      //小件回传
+        if(msg!="请求成功" || succ == false){
+            debugLog(QString("---- [smallItem request]something get wrong! msg: %1").arg(msg));
+        }
+        reply->deleteLater();
+        tryStartNext();
+        return;
+    }
 
     reply->deleteLater();
     tryStartNext();
@@ -800,7 +808,7 @@ void JTRequest::requestUploadData(const QString& Code, const QString& weight) //
     //debugLog(QString("requestUploadData -> Payload: %1").arg(QString::fromUtf8(payload)));
     enqueueOrSend(req, payload, "upload", 5);
 }
-void JTRequest::requestBuild(const QString& packageNum)
+void JTRequest::requestBuild(const QString& packageNum)                                             //建包接口，
 {
     // 1) 从数据库读取用于构建 detail 的行（你已有的接口）
     //    假定 _sqlForBuild.queryRowsByField 返回 vector<map<string,string>>
@@ -874,15 +882,32 @@ void JTRequest::requestBuild(const QString& packageNum)
     // 如果需要 token 授权头
     attachAuthHeader(req);
 
-    // 调试日志（可选）
-    debugLog(QString("requestBuild -> URL: %1").arg(url.toString()));
-    debugLog(QString("requestBuild -> Payload size: %1 bytes").arg(payload.size()));
-    debugLog(QString("requestBuild -> Payload: %1").arg(QString::fromUtf8(payload)));
-
     // 这里使用 reqTag = "build" 以便在 onNetworkFinished 中区分处理
     enqueueOrSend(req, payload, "build", 3);
 }
-void JTRequest::requestSmallData(const QString& code) {                                 //小件回传
+void JTRequest::requestBuildOneByOne(const QString& code){
+
+    QString listId = m_account;
+    if (listId.isEmpty()) listId = "opa"; // 防御性处理
+    listId += QString::number(QDateTime::currentMSecsSinceEpoch());
+
+    // master 对象
+    QJsonObject masterObj;
+    masterObj["listId"] = listId;
+    // 若没有任何 scanTime，则使用当前时间
+    masterObj["scanTime"] = !firstScanTime.isEmpty() ? firstScanTime : QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss");
+    masterObj["packageNumber"] = packageNum;
+    masterObj["scanPda"] = m_equipmentID;
+    QJsonObject rootObj;
+    rootObj["detailList"] = detailArr;
+    rootObj["master"] = masterObj;
+    QJsonArray outer;
+    outer.append(rootObj);
+
+    QJsonDocument doc(outer);
+    QByteArray payload = doc.toJson(QJsonDocument::Compact);
+}
+void JTRequest::requestSmallData(const QString& code, const QString& weight) {                                 //小件回传与建包同时使用
     QString time_mill = QString::fromStdString(std::to_string(currentTimeMillis()));
     // 单条数据对象
     QJsonObject item;
@@ -890,6 +915,7 @@ void JTRequest::requestSmallData(const QString& code) {                         
     item["networkCode"] = m_account;                                //网点编码
     item["scanTime"] = QString::fromStdString(getCurrentTime());    //扫描时间
     item["userNum"] = m_account;                                    //登陆人账号
+    item["weight"] = weight;                                        //重量
     item["uploadResult"] = 1;                                       //上件扫描识别结果1 成功 2失败
     item["crossBeltMac"] = "";                                      //交叉带MAC地址
     item["supplyDeskCode"] = "";                                    //供包台编号
@@ -923,15 +949,16 @@ void JTRequest::requestSmallData(const QString& code) {                         
     // 序列化为 JSON 数组
     QJsonDocument doc(bodyArr);
     QByteArray payload = doc.toJson(QJsonDocument::Compact);
+    Logger::getInstance().Log("----[JTRequest] requestSmallData() request body: "+ QString::fromUtf8(payload).toStdString());
 
-    // 请求配置
-    QUrl url(m_baseUrl + "/opa/smart/scan/uploadArrivalCRLSData");
+    QUrl url("https://assscan.jtexpress.com.cn/assscanface/face/assScanSmallUpper/smallUpperDataUpload");
     QNetworkRequest req(url);
     req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
     req.setRawHeader("Accept", "application/json");
+    req.setRawHeader("appKey", m_appKey.toUtf8());
     req.setTransferTimeout(5000); // 例如 5s
 
-    QString timestamp = QString::fromStdString(getCurrentTime());
+    QString timestamp = QString::number(QDateTime::currentSecsSinceEpoch());
     req.setRawHeader("timestamp", timestamp.toUtf8());
 
     {   // 加 token
@@ -940,10 +967,73 @@ void JTRequest::requestSmallData(const QString& code) {                         
             req.setRawHeader("token", m_authToken.toUtf8());
         }
     }
-    // Bearer token
     attachAuthHeader(req);
-    //debugLog(QString("requestUploadData -> URL: %1").arg(url.toString()));
-    //debugLog(QString("requestUploadData -> Payload: %1").arg(QString::fromUtf8(payload)));
-    enqueueOrSend(req, payload, "upload", 5);
+    enqueueOrSend(req, payload, "smallItem", 3);
 }
+void JTRequest::unloadToPieces(const QString& code, const QString& weight){                            //卸车到件, 进港
+    QString time_mill = QString::fromStdString(std::to_string(currentTimeMillis()));
+    QJsonObject item;
+    item["listId"] = m_account + time_mill;
+    item["waybillId"] = code;
+    item["scanTime"] = QString::fromStdString(getCurrentTime());
+    item["scanTypeCode"] = 92;                                                                          //到件扫描，集散进港
+    item["weight"] = weight;
+    item["transportTypeCode"] = 02;
+    item["scanPda"] = "";                                                                               //设备编号
+    item["scanType"] = 1;                                                                               //运单
+    item["weightFlag"] = 2;                                                                             //称重
+
+    QJsonArray bodyArr;
+    bodyArr.append(item);
+    QJsonDocument doc(bodyArr);
+    QByteArray payload = doc.toJson(QJsonDocument::Compact);
+    Logger::getInstance().Log("----[JTRequest] unloadToPieces() request body: "+QString::fromUtf8(payload).toStdString());
+
+    QUrl url("https://opa.jtexpress.com.cn/opa/smart/scan/uploadlnloadingArrivalData");
+    QNetworkRequest req(url);
+    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    req.setTransferTimeout(5000); // 例如 5s
+    QString timestamp = QString::fromStdString(getCurrentTime());
+    req.setRawHeader("timestamp", timestamp.toUtf8());
+    attachAuthHeader(req);
+    enqueueOrSend(req, payload, "unloadToPieces", 3);
+}
+void JTRequest::outboundScanning(const QString& code){                                                 //出仓扫描， 进港
+    QString time_mill = QString::fromStdString(std::to_string(currentTimeMillis()));
+    QJsonObject item;
+    item["listId"] = m_account + time_mill;     // 网点编码+当前时间毫秒数
+    item["waybillId"] = code;
+    item["deliveryCode"] = "";                  //派件员code
+    item["scanTime"] = QString::fromStdString(getCurrentTime());
+    item["scanPda"] = "";                       //设备编号
+
+    QJsonArray bodyArr;
+    bodyArr.append(item);
+    QJsonDocument doc(bodyArr);
+    QByteArray payload = doc.toJson(QJsonDocument::Compact);
+    Logger::getInstance().Log("----[JTRequest] outboundScanning() request body: "+QString::fromUtf8(payload).toStdString());
+
+    QUrl url("https://opa.jtexpress.com.cn/opa/smart/scan/uploadDeliveryOutStockData");
+    QNetworkRequest req(url);
+    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    req.setTransferTimeout(5000); // 例如 5s
+    QString timestamp = QString::fromStdString(getCurrentTime());
+    req.setRawHeader("timestamp", timestamp.toUtf8());
+    attachAuthHeader(req);                                                              //请求头加入autoken， 是登录成功后返回的token值
+    enqueueOrSend(req, payload, "outboundScanning", 3);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
