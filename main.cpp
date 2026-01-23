@@ -15,9 +15,10 @@ int main(int argc, char *argv[])
         Logger::getInstance().Log("WSAStartup failed : " + std::to_string(wsaRet));
     }
 #endif
+
     SqlConnectionPool::instance().init(30);
     QApplication a(argc, argv);
-
+    Logger::getInstance().Log("------------------------------------------ window start ------------------------------------------");
     QTranslator translator;
     const QStringList uiLanguages = QLocale::system().uiLanguages();
     for (const QString &locale : uiLanguages) {

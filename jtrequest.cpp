@@ -19,8 +19,6 @@ JTRequest::JTRequest(QObject* parent)
     timeoutTimer.setInterval(2000); // 每 2s 检查一次超时
     connect(&timeoutTimer, &QTimer::timeout, this, &JTRequest::checkPendingTimeouts);
     timeoutTimer.start();
-    m_account = "WD01320584";
-    m_password = "2971ddce41fd043263898ddbd9a34e3a";
     requestToken(m_account, m_password, m_appKey, m_appSecret);//请求获取token
 }
 JTRequest::~JTRequest()
@@ -143,9 +141,9 @@ void JTRequest::enqueueOrSend(const QNetworkRequest& req, const QByteArray& payl
             if (m_requestQueue.size() < maxQueueSize) {
                 ReqItem it{req,payload,reqTag,maxRetries};
                 m_requestQueue.enqueue(it);
-                log("---- [加入请求] 地址:[" + req.url().toString().toStdString() + "], 队列中数量:[" + std::to_string(m_requestQueue.size()) + "]");
+                log("----[加入请求] 地址:[" + req.url().toString().toStdString() + "], 队列中数量:[" + std::to_string(m_requestQueue.size()) + "]");
             } else {
-                log("---- [加入请求] 队列已满，正在丢弃请求: [" + req.url().toString().toStdString() + "]");
+                log("----[加入请求] 队列已满，正在丢弃请求: [" + req.url().toString().toStdString() + "]");
             }
         } else {
             // 有并发位置，准备直接发送
@@ -172,7 +170,7 @@ void JTRequest::enqueueOrSend(const QNetworkRequest& req, const QByteArray& payl
             QMutexLocker l(&m_mutex);
             m_pending.insert(reply, QDateTime::currentMSecsSinceEpoch());
         }
-        log("---- [发送请求] 立即请求地址: [" + req.url().toString().toStdString() + "]");
+        log("----[发送请求] 立即请求地址: [" + req.url().toString().toStdString() + "]");
     }
 }
 //签名
@@ -385,7 +383,7 @@ void JTRequest::onNetworkFinished(QNetworkReply* reply) //所有的回调
 
     // ---------- 2) 正常情况下再读取数据（reply 没被 abort） 成功路径
     QByteArray data = reply->readAll();
-
+    log("---- [JTRequest] onNetworkFinished（） reqeust tag: [" + reqTag.toStdString() + "], return body: [" + QString::fromUtf8(data.left(512)).toStdString() + "]");
     // ---------- 3) 解析 JSON
     QJsonParseError parseErr;
     QJsonDocument doc = QJsonDocument::fromJson(data, &parseErr);
@@ -653,7 +651,7 @@ void JTRequest::onNetworkFinished(QNetworkReply* reply) //所有的回调
         tryStartNext();
         return;
     }
-    if (reqTag == "upload") //四合一
+    if (reqTag == "upload")                         //四合一
     {
         if (msg != "请求成功" || succ == false)
         {
@@ -663,7 +661,7 @@ void JTRequest::onNetworkFinished(QNetworkReply* reply) //所有的回调
         tryStartNext();
         return;
     }
-    if (reqTag == "build")   //建包
+    if (reqTag == "build")                          //建包
     {
         if (msg != "请求成功" || succ == false)
         {
@@ -701,6 +699,7 @@ void JTRequest::requestToken(const QString& account, const QString& password, co
 
     QJsonDocument doc(body);
     QByteArray payload = doc.toJson(QJsonDocument::Compact);
+    Logger::getInstance().Log("----[JTRequest] requestToken() request body: "+QString::fromUtf8(payload).toStdString());
 
     QUrl url(m_baseUrl + "/opa/smartLogin");
     QNetworkRequest req(url);
@@ -708,17 +707,16 @@ void JTRequest::requestToken(const QString& account, const QString& password, co
     req.setRawHeader("Accept", "application/json");
     req.setTransferTimeout(5000); // 例如 5s
 
-    //debugLog(QString("requestToken -> URL: %1").arg(url.toString()));
     enqueueOrSend(req, payload, "login", 1, true);
 }
-void JTRequest::requestTerminalCode(const QString& Code)    //请求一段码
+void JTRequest::requestTerminalCode(const QString& Code)                                //请求一段码
 {
     QJsonObject body;
     body["waybillNo"] = Code;
     QJsonDocument doc(body);
     QByteArray payload = doc.toJson(QJsonDocument::Compact);
+    Logger::getInstance().Log("----[JTRequest] requestTerminalCode() request body: "+QString::fromUtf8(payload).toStdString());
 
-    // 构造 URL（你可以继续用 m_baseUrl + m_terminalUrl 的方式，这里按你示例使用固定完整 URL）
     QUrl url(m_terminalUrl);
     QNetworkRequest req(url);
     req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
@@ -739,31 +737,25 @@ void JTRequest::requestTerminalCode(const QString& Code)    //请求一段码
     req.setTransferTimeout(5000); // 5s
 #endif
 
-    // ---- 在 header 中加入 Postman 里看到的字段 ----
     // appKey
     if (!m_appKey.isEmpty()) {
         req.setRawHeader("appKey", m_appKey.toUtf8());
     }
 
-    // timestamp (格式 yyyy-MM-dd HH:mm:ss)
     QString timestamp = QString::fromStdString(getCurrentTime());
     req.setRawHeader("timestamp", timestamp.toUtf8());
 
-    // token (有些接口同时需要 Authorization 和 token header)
     {
         QMutexLocker l(&m_mutex); // 读取 m_authToken 线程安全保护
         if (!m_authToken.isEmpty()) {
             req.setRawHeader("token", m_authToken.toUtf8());
         }
     }
-    // 调试日志：输出 URL / payload / headers 以便对比 Postman
-    //debugLog(QString("requestTerminalCode -> URL: %1").arg(url.toString()));
-    //debugLog(QString("requestTerminalCode -> Payload: %1").arg(QString::fromUtf8(payload)));
 
     enqueueOrSend(req, payload, "get_terminalCode", 5);
 }
 
-void JTRequest::requestUploadData(const QString& Code, const QString& weight) // 四合一 到件补收入发
+void JTRequest::requestUploadData(const QString& Code, const QString& weight)                           // 四合一 到件补收入发，出港，扫描后直接使用
 {
     QString time_mill = QString::fromStdString(std::to_string(currentTimeMillis()));
 
@@ -796,16 +788,14 @@ void JTRequest::requestUploadData(const QString& Code, const QString& weight) //
     QString timestamp = QString::fromStdString(getCurrentTime());
     req.setRawHeader("timestamp", timestamp.toUtf8());
 
-    {   // 加 token
-        QMutexLocker l(&m_mutex);
-        if (!m_authToken.isEmpty()) {
-            req.setRawHeader("token", m_authToken.toUtf8());
-        }
-    }
-    // Bearer token
+    // {   // 加 token
+    //     QMutexLocker l(&m_mutex);
+    //     if (!m_authToken.isEmpty()) {
+    //         req.setRawHeader("token", m_authToken.toUtf8());
+    //     }
+    // }
+
     attachAuthHeader(req);
-    //debugLog(QString("requestUploadData -> URL: %1").arg(url.toString()));
-    //debugLog(QString("requestUploadData -> Payload: %1").arg(QString::fromUtf8(payload)));
     enqueueOrSend(req, payload, "upload", 5);
 }
 void JTRequest::requestBuild(const QString& packageNum)                                             //建包接口，
@@ -885,17 +875,41 @@ void JTRequest::requestBuild(const QString& packageNum)                         
     // 这里使用 reqTag = "build" 以便在 onNetworkFinished 中区分处理
     enqueueOrSend(req, payload, "build", 3);
 }
-void JTRequest::requestBuildOneByOne(const QString& code){
+void JTRequest::requestBuildOneByOne(const QString& code, const QString& packageNum){                       //单个件建包接口， 在掉格口的时候使用
+
+    auto _sql = SqlConnectionPool::instance().acquire();
+    QString scanTime = "";
+    if(_sql){
+        auto scan_time = _sql->queryString("supply_data","code",code.toStdString(),"scan_time");
+        if(scan_time){
+            scanTime = QString::fromStdString(*scan_time);
+        }
+        else{
+            scanTime = QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss");
+        }
+    }
+    else{
+        scanTime = QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss");
+    }
 
     QString listId = m_account;
     if (listId.isEmpty()) listId = "opa"; // 防御性处理
     listId += QString::number(QDateTime::currentMSecsSinceEpoch());
+    QJsonArray detailArr;
+    QJsonObject d;
+    d["listId"] = listId;
+    d["waybillId"] = code;
+
+    d["scanTime"] = scanTime.isEmpty() ? QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss") : scanTime;
+    d["packageNumber"] = packageNum;
+    d["scanPda"] = m_equipmentID;
+    detailArr.append(d);
 
     // master 对象
     QJsonObject masterObj;
     masterObj["listId"] = listId;
     // 若没有任何 scanTime，则使用当前时间
-    masterObj["scanTime"] = !firstScanTime.isEmpty() ? firstScanTime : QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss");
+    masterObj["scanTime"] = QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss");
     masterObj["packageNumber"] = packageNum;
     masterObj["scanPda"] = m_equipmentID;
     QJsonObject rootObj;
@@ -903,33 +917,47 @@ void JTRequest::requestBuildOneByOne(const QString& code){
     rootObj["master"] = masterObj;
     QJsonArray outer;
     outer.append(rootObj);
-
     QJsonDocument doc(outer);
     QByteArray payload = doc.toJson(QJsonDocument::Compact);
+    Logger::getInstance().Log("----[JTRequest] requestBuildOneByOne() request body: "+ QString::fromUtf8(payload).toStdString());
+
+    QUrl url("https://assscan.jtexpress.com.cn/opa/smart/scan/uploadPackData");
+    QNetworkRequest req(url);
+    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    req.setRawHeader("Accept", "application/json");
+    // req.setRawHeader("appKey", m_appKey.toUtf8());
+    attachAuthHeader(req);
+    enqueueOrSend(req, payload, "build", 3);
 }
-void JTRequest::requestSmallData(const QString& code, const QString& weight) {                                 //小件回传与建包同时使用
+void JTRequest::requestSmallData(const QString& code,
+                                 const QString& weight,
+                                 int operateType,
+                                 int slot_id,
+                                 int supply_id,
+                                 const QString& supply_mac) {                       //小件回传与建包同时使用,落格口的时候使用
     QString time_mill = QString::fromStdString(std::to_string(currentTimeMillis()));
     // 单条数据对象
     QJsonObject item;
+
     item["waybillNo"] = code;
     item["networkCode"] = m_account;                                //网点编码
     item["scanTime"] = QString::fromStdString(getCurrentTime());    //扫描时间
     item["userNum"] = m_account;                                    //登陆人账号
     item["weight"] = weight;                                        //重量
     item["uploadResult"] = 1;                                       //上件扫描识别结果1 成功 2失败
-    item["crossBeltMac"] = "";                                      //交叉带MAC地址
-    item["supplyDeskCode"] = "";                                    //供包台编号
-    item["supplyDeskMac"] = "";									    //供包台MAC地址
+    item["crossBeltMac"] = "00-1B-21-CA-3F-67";                     //交叉带MAC地址
+    item["supplyDeskCode"] = supply_id;                             //供包台编号
+    item["supplyDeskMac"] = supply_mac;                             //供包台MAC地址
     item["uploadTime"] = QString::fromStdString(getCurrentTime());  //上传时间
-    item["sortingPlanCode"] = "";                                   //分拣方案编码
-    item["operateType"] = 1;                                        //操作模式 1.出港 2.进港
-    item["equipmentCode"] = "";                                     //设备编号
+    item["sortingPlanCode"] = "1";                                  //分拣方案编码
+    item["operateType"] = operateType;                              //操作模式 1.出港 2.进港
+    item["equipmentCode"] = "JDZN00001";                            //设备编号
     item["equipmentLayer"] = 1;                                     //设备层数
-    item["gridNo"] = "";                                            //格口号
+    item["gridNo"] = slot_id;                                       //格口号
     item["fallTime"] = QString::fromStdString(getCurrentTime());    //落格时间
     item["cyclesNum"] = 1;                                          //循环圈数
-    item["carNum"] = "";                                            //小车编号
-    item["gridCode"] = "";                                          //格口编码类型 :（
+    item["carNum"] = 100;                                           //小车编号
+    item["gridCode"] = 111;                                         //格口编码类型 :（
     /*正常读码：111 ；
     超重件 : 990;
     欠费拦截口 : 991;
@@ -961,12 +989,12 @@ void JTRequest::requestSmallData(const QString& code, const QString& weight) {  
     QString timestamp = QString::number(QDateTime::currentSecsSinceEpoch());
     req.setRawHeader("timestamp", timestamp.toUtf8());
 
-    {   // 加 token
-        QMutexLocker l(&m_mutex);
-        if (!m_authToken.isEmpty()) {
-            req.setRawHeader("token", m_authToken.toUtf8());
-        }
-    }
+    // {   // 加 token
+    //     QMutexLocker l(&m_mutex);
+    //     if (!m_authToken.isEmpty()) {
+    //         req.setRawHeader("token", m_authToken.toUtf8());
+    //     }
+    // }
     attachAuthHeader(req);
     enqueueOrSend(req, payload, "smallItem", 3);
 }
@@ -979,7 +1007,7 @@ void JTRequest::unloadToPieces(const QString& code, const QString& weight){     
     item["scanTypeCode"] = 92;                                                                          //到件扫描，集散进港
     item["weight"] = weight;
     item["transportTypeCode"] = 02;
-    item["scanPda"] = "";                                                                               //设备编号
+    item["scanPda"] = "JDZN00001";                                                                               //设备编号
     item["scanType"] = 1;                                                                               //运单
     item["weightFlag"] = 2;                                                                             //称重
 
@@ -998,7 +1026,7 @@ void JTRequest::unloadToPieces(const QString& code, const QString& weight){     
     attachAuthHeader(req);
     enqueueOrSend(req, payload, "unloadToPieces", 3);
 }
-void JTRequest::outboundScanning(const QString& code){                                                 //出仓扫描， 进港
+void JTRequest::outboundScanning(const QString& code){                                                 //出仓扫描， 进港， 还不清楚什么时候使用
     QString time_mill = QString::fromStdString(std::to_string(currentTimeMillis()));
     QJsonObject item;
     item["listId"] = m_account + time_mill;     // 网点编码+当前时间毫秒数

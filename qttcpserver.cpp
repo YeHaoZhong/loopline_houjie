@@ -1,6 +1,6 @@
 #include "QtTcpServer.h"
 #include <QDebug>
-
+#include "logger.h"
 QtTcpServer::QtTcpServer(QObject* parent)
     : QObject(parent)
 {
@@ -23,7 +23,8 @@ bool QtTcpServer::start(quint16 port, const QHostAddress& address)
         qWarning() << "TcpServer listen failed:" << m_server->errorString();
     }
     else {
-        qInfo() << "TcpServer listening on" << address.toString() << ":" << port;
+        // qInfo() << "TcpServer listening on" << address.toString() << ":" << port;
+        Logger::getInstance().Log("----[QtTcpServer] start() TcpServer listening on: ["+address.toString().toStdString()+"], port: ["+std::to_string(port)+"]");
     }
     return ok;
 }

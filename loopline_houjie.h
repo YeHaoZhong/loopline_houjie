@@ -3,6 +3,8 @@
 
 #include <QWidget>
 #include "dataprocess.h"
+#include "sqlconnectionpool.h"
+#include <QCloseEvent>
 QT_BEGIN_NAMESPACE
 namespace Ui {
 class loopline_houjie;
@@ -24,6 +26,15 @@ private:
 private slots:
     void onRunBtnClicked();
     void onStopBtnClicked();
-
+protected:
+    void closeEvent(QCloseEvent *event) override
+    {
+        try{
+            m_dataProcess.dataProCleanUp();
+            Logger::getInstance().close();
+            SqlConnectionPool::instance().shutdown();
+        }catch(...){}
+        event->accept();
+    }
 };
 #endif // LOOPLINE_HOUJIE_H

@@ -8,7 +8,7 @@ extern std::string getCurrentTime();
 DataProcess::DataProcess()                      //开服务,并初始化程序中的资源以及设置
 {
     try {
-        _udpSupplyReceiver = new UdpReceiver(3011, "0.0.0.0");             //接收拱包信息
+        _udpSupplyReceiver = new UdpReceiver(3011, "192.168.2.98");             //接收拱包信息
         _udpSupplyReceiver->setCallback([this](const std::vector<uint8_t>& data, const std::string& ip, uint16_t port)
                                         {
                                             const std::string& text = std::string(data.begin(), data.end());
@@ -17,6 +17,7 @@ DataProcess::DataProcess()                      //开服务,并初始化程序�
                                                 supplyRingDrops.fetch_add(1,std::memory_order_relaxed);
                                             }
                                         });
+        _udpSupplyReceiver->start();
         startSupplyWorker();
         m_recvPdaServer = new QtTcpServer(this);                                        //接收PDA消息
         if (!m_recvPdaServer->start(m_recvPdaPort)) {
@@ -40,6 +41,7 @@ DataProcess::DataProcess()                      //开服务,并初始化程序�
                 slotStatusRingDrops.fetch_add(1,std::memory_order_relaxed);
             }
         };
+
     }
     catch (...) {}
 }
@@ -67,12 +69,22 @@ void DataProcess::dbInit(){
             m_terminalCodeToSlot[terminal_code] = slot_id;
         }
     }
+    m_supplyMacVector.resize(12);
+    auto supply_mac = _sql->readTable("supply_config");
+    if(!supply_mac.empty()){
+        for (const auto& row: supply_mac){
+            if(row.size()<3) continue;
+            int vector_supply_id = std::stoi(row[0]) - 1;
+            m_supplyMacVector[vector_supply_id] = row[2];           //初始化供包台mac地址
+        }
+    }
 }
 void DataProcess::startSupplyWorker(){                                                  //接收供包信息
     supplyWorkerRunning = true;
     supplyWorkerThread = std::thread([this](){
         const size_t BATCH = 256;
         supplyRaw batch[BATCH];
+        Logger::getInstance().Log("----[DataProcess] startSupplyWorker() start receive supply thread!");
         while (supplyWorkerRunning) {
             size_t n = supplyRing.pop_bulk(batch, BATCH);
             if(n == 0){                                         //空闲
@@ -90,13 +102,14 @@ void DataProcess::stopSupplyWorker(){                                           
     supplyWorkerRunning = false;
     if(supplyWorkerThread.joinable()) supplyWorkerThread.join();
 }
-void DataProcess::dataProInit()
+void DataProcess::dataProInit()                             //点击了运行按钮
 {
     // connect(&m_plc_supplyClient, &SocketClient::dataReceived, this, &DataProcess::onPLCSupplyRecv);
     // connect(&m_plc_sendSlotClient, &SocketClient::dataReceived, this, &DataProcess::onPLCSendSlotRecv);
+    m_deviceRunning.store(true);
     tcpConnect();
-    startUnloadWorker();
-    startSlotStatusWorker();
+    startUnloadWorker();                        //接收下件信息线程
+    startSlotStatusWorker();                    //接收格口状态线程
 }
 void DataProcess::startUnloadWorker(){
     unloadWorkerRunning = true;
@@ -163,15 +176,17 @@ void DataProcess::tcpConnect() {                        //tcp连接
     plcSendSlotTcpConnect(false);
     plcRecvUnloadTcpConnect(false);
     plcRecvSlotStatusTcpConnect(false);
+    startTcpCheckThread();
 
 }
-void DataProcess::tcpDisconnect() {                     //tcp断开连接
+void DataProcess::tcpDisconnect() {                     //tcp断开连接,即点击了停止按钮
     try {
+        m_deviceRunning.store(false);
+        stopTcpCheckThread();
         m_plc_supplyClient.disconnect();
         m_plc_sendSlotClient.disconnect();
         m_plc_unloadClient.disconnect();
         m_plc_slotStatusClient.disconnect();
-        stopTcpCheckThread();
     }
     catch (...) {}
 
@@ -193,6 +208,7 @@ void DataProcess::checkTcpConn() {                      //检查tcp连接
             plcRecvSlotStatusTcpConnect(true);
         }
         catch (...) {}
+        std::this_thread::sleep_for(std::chrono::milliseconds(5000));            //三秒检查一次
     }
 }
 void DataProcess::stopTcpCheckThread() {                //停止检查线程
@@ -217,12 +233,13 @@ bool DataProcess::plcSupplyTcpConnect(bool destorySock) {
                 SOCKET ok = m_plc_supplyClient.connectTo(m_plc_ip, m_plc_supply,false);                     //不开启接收线程
                 if (ok == INVALID_SOCKET) {
                     Logger::getInstance().Log("----[DataProcess] plcSupplyTcpConnect() Connect to supply port failed!");
+                    m_plcSupplyMutex.unlock();
                     return false;
                 }
-                m_plcSupplyMutex.unlock();
                 Logger::getInstance().Log("----[DataProcess] plcSupplyTcpConnect() Connect to supply port successfully!");
             }
         }
+        m_plcSupplyMutex.unlock();
         return true;
     }
     catch (...) {}
@@ -241,12 +258,13 @@ bool DataProcess::plcSendSlotTcpConnect(bool destorySock) {
                 SOCKET ok = m_plc_sendSlotClient.connectTo(m_plc_ip, m_plc_sendSlot,false);                     //不开启接收线程
                 if (ok == INVALID_SOCKET) {
                     Logger::getInstance().Log("----[DataProcess] plcSendSlotTcpConnect() Connect to send slot port failed!");
+                    m_plcSendSlotMutex.unlock();
                     return false;
                 }
-                m_plcSendSlotMutex.unlock();
                 Logger::getInstance().Log("----[DataProcess] plcSendSlotTcpConnect() Connect to send slot port successfully!");
             }
         }
+        m_plcSendSlotMutex.unlock();
         return true;
     }
     catch (...) {}
@@ -306,12 +324,30 @@ void DataProcess::onPLCUnLoadRecv(const QByteArray& data) {                     
         std::string dataStr = data.toStdString();
         Logger::getInstance().Log("----[DataProcess] onPLCUnLoadRecv() recv data: [" + dataStr + "]");
         std::string id_msg = "";                                                                        //供包台号以及序列号
+        int supply_id = -1;                                                                             //从消息中获取供包台号
+        if(supply_id<1||supply_id>12) supply_id = 1;
+        std::string supply_mac = m_supplyMacVector[supply_id - 1];
         if(dataStr.find(unload_fail) == std::string::npos){                                             //下件成功, 进行集包请求
             const std::string& code = m_msgToCodeMap[id_msg];                                           //获取单号
+            auto _sql = SqlConnectionPool::instance().acquire();
+            std::string weight = "0.5";                                                                 //初始化重量
+            if(_sql){
+                auto db_weight = _sql->queryString("supply_data","code",code,"weight");
+                if(db_weight)
+                {
+                    weight = *db_weight;
+                }
+            }
             int slot_id = m_codeToSlotMap[code];                                                        //获取格口号
-            const std::string& packageNume = m_slotToPackage[slot_id];                                  //获取包牌号
-            // QMetaObject::invokeMethod(&m_requestAPI,
-            //                           "")
+            const std::string& packageNum = m_slotToPackage[slot_id];                                   //获取包牌号
+            QMetaObject::invokeMethod(&m_requestAPI,                                                    //建包
+                                      "requestBuildOneByOne",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(QString, QString::fromStdString(code)), Q_ARG(QString, QString::fromStdString(packageNum)));
+            QMetaObject::invokeMethod(&m_requestAPI,                                                    //小件回传
+                                      "requestSmallData",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(QString,QString::fromStdString(code)),Q_ARG(QString,QString::fromStdString(weight)),Q_ARG(int,m_operateType),Q_ARG(int, slot_id));
         }
     }
     catch(...){}
@@ -329,6 +365,7 @@ void DataProcess::onPLCSlotStatusRecv(const QByteArray& data) {                 
 void DataProcess::onSupplyUDPServerRecv(const std::string& message) {							//接收供包台消息, 发送给PLC, 并写入数据库, 判断是否有请求格口, 若没有进行格口请求.(同时需要判断进出港件)
     try {
         Logger::getInstance().Log("----[DataProcess] onSupplyUDPServerRecv() message: [" + message + "]");
+        if(!m_deviceRunning.load()) return;                                                     //设备停止状态
         auto [code, weight, supply_id] = splitUdpMessage(message);
         if (supply_id <= 0 || supply_id > 12) {
             return;
@@ -351,26 +388,36 @@ void DataProcess::onSupplyUDPServerRecv(const std::string& message) {							//�
 }
 void DataProcess::requestAndSendToPLC(const std::string& code,const std::string& weight, int slot_id){            //若没请求一段码则进行请求, 若请求过则发送到plc中, 需要判断是进港还是出港
     try{
-        if(m_operateType == 1){                                             //进港
-            if(slot_id<=0){                                                    //未请求,进行请求
+        if(m_operateType == 1){                                                 //进港
+            if(slot_id<=0){
                 QMetaObject::invokeMethod(&m_requestAPI,
-                                          "requestUploadData",                 //四合一
+                                          "unloadToPieces",                     //卸车到件
                                           Qt::QueuedConnection,
-                                          Q_ARG(QString, QString::fromStdString(code)), Q_ARG(QString, QString::fromStdString(weight))
+                                          Q_ARG(QString, QString::fromStdString(code))
                                           );
                 QMetaObject::invokeMethod(&m_requestAPI,
-                                          "requestTerminalCode",               //一段码
+                                          "requestTerminalCode",                //一段码
                                           Qt::QueuedConnection,
                                           Q_ARG(QString, QString::fromStdString(code))
                                           );
             }
-            else{                                                                   //已请求, 发送至plc
+        }else if(m_operateType == 2){                                           //出港
+            if(slot_id<=0){                                                     //未请求,进行请求
+                QMetaObject::invokeMethod(&m_requestAPI,
+                                          "requestUploadData",                  //四合一
+                                          Qt::QueuedConnection,
+                                          Q_ARG(QString, QString::fromStdString(code)), Q_ARG(QString, QString::fromStdString(weight))
+                                          );
+                QMetaObject::invokeMethod(&m_requestAPI,
+                                          "requestTerminalCode",                //一段码
+                                          Qt::QueuedConnection,
+                                          Q_ARG(QString, QString::fromStdString(code))
+                                          );
+            }
+            else{                                                               //已请求, 发送至plc
                 sendSlotToPLC(code,slot_id);
             }
-        }else if(m_operateType == 2){                                       //出港
-
         }
-
     }
     catch(...){}
 }
@@ -573,6 +620,10 @@ void DataProcess::onPdaTCPServerRecv(int clientId, const QString& message) {    
         std::string new_package = "";
         std::string msgStr = message.toStdString();
         Logger::getInstance().Log("----[DataProcess] onPdaTCPServerRecv() clientId: " + std::to_string(clientId) + ", message: [" + msgStr + "]");
+        if(!m_deviceRunning.load())                                                                 //线体停止状态
+        {
+            return;
+        }
         //m_slotToPackage
         if(m_slotStatus[slot_id] == 1)                                                              //锁格状态
         {

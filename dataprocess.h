@@ -42,17 +42,17 @@ private:
 
 private:
     std::shared_mutex m_plcSupplyMutex;
-    SocketClient m_plc_supplyClient;        //2011 socket连接
+    SocketClient m_plc_supplyClient;        //2061 socket连接
     std::shared_mutex m_plcSendSlotMutex;
-    SocketClient m_plc_sendSlotClient;      //2012 socket连接
+    SocketClient m_plc_sendSlotClient;      //2062 socket连接
     std::shared_mutex m_plcUnloadMutex;
-    SocketClient m_plc_unloadClient;        //2013 socket连接
-    SocketClient m_plc_slotStatusClient;    //2014 socket连接
+    SocketClient m_plc_unloadClient;        //2063 socket连接
+    SocketClient m_plc_slotStatusClient;    //2064 socket连接
     std::string m_plc_ip = "192.168.2.10";
-    int m_plc_supply = 2011;                                                //发送上件端口
-    int m_plc_sendSlot = 2012;                                              //发送格口端口
-    int m_plc_unload = 2013;                                                //接收下件端口
-    int m_plc_slotStatus = 2014;                                            //接收格口状态端口
+    int m_plc_supply = 2061;                                                //发送上件端口
+    int m_plc_sendSlot = 2062;                                              //发送格口端口
+    int m_plc_unload = 2063;                                                //接收下件端口
+    int m_plc_slotStatus = 2064;                                            //接收格口状态端口
 
     std::deque<std::string> m_sendPLCSupplyDataQueue;                       //发送供包台数据队列
     std::deque<std::string> m_haveSentPLCSupplyDataQueue;                   //已发送供包台数据队列
@@ -108,6 +108,9 @@ private:
     void startSlotStatusWorker();
     void stopSlotStatusWorker();
     void onPLCSlotStatusRecv(const QByteArray& data);  //2014
+
+    std::atomic<bool> m_deviceRunning{false};                       //开启运行后， 代表线体起来
+    std::vector<std::string> m_supplyMacVector;
 
 signals:
     void onUDPReceived(const QString& message);

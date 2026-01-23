@@ -111,7 +111,7 @@ Logger::Logger() {
                     }
 
                     // 输出到控制台
-                    std::cout << finalMsg << std::endl;
+                    // std::cout << finalMsg << std::endl;
                 }
                 catch (const std::exception& ex) {
                     // 后台线程必须稳健，不让异常终止线程

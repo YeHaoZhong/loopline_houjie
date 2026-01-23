@@ -48,8 +48,6 @@ public:
     void requestToken(const QString& account, const QString& password, const QString& appKey, const QString& appSecret);
     void startRefreshIfNeeded();
 
-
-
     //void requestUploadingData(const QString& pakageNum, const QString& weight);	//卸车到件扫描
     //void requestWarehouseScan(const QString& Code);	//入仓扫描
     //void requestLoadCar(const QString& Code);	//装车发件扫描
@@ -69,8 +67,8 @@ private:
     QString m_authToken;                //登录token
     QString m_refreshToken;             //
     QString	m_SortPlanCode;             //格口方案编号
-    QString m_account;                  //账户(网点)
-    QString m_password;                 //密码
+    QString m_account_;                  //账户(网点)
+    QString m_password_;                 //密码
     QString m_appKey = "GZJD001231121";
     QString m_appSecret = "kI8gLrUxTSVaRx0ZjhCwkQ==";
 
@@ -86,7 +84,12 @@ private slots:
     void onNetworkFinished(QNetworkReply* reply);
     void checkPendingTimeouts();
     void requestTerminalCode(const QString& code);                                              //请求三段码
-    void requestSmallData(const QString& code, const QString& weight);                          //小件回传数据
+    void requestSmallData(const QString& code,
+                          const QString& weight,
+                          int operateType,
+                          int slot_id,
+                          int supply_id,
+                          const QString& supply_mac);         //小件回传数据
 
     void requestUploadData(const QString& code, const QString& weight);                         //四合一扫描,补收入发 集散点
     void requestBuild(const QString& packageNum);                                               //建包接口,所有数据从数据库拿

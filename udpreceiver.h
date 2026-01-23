@@ -42,13 +42,13 @@ public:
     // callback: (dataBytes, remoteIp, remotePort)
     using Callback = std::function<void(const std::vector<uint8_t>&, const std::string&, uint16_t)>;
 
-    UdpReceiver(uint16_t port = 3680, const std::string& bindIp = "0.0.0.0")
+    UdpReceiver(uint16_t port = 3011, const std::string& bindIp = "0.0.0.0")
         : port_(port), bindIp_(bindIp), sock_(INVALID_SOCK), running_(false)
     {
-        /*port_ = 3677;
+        port_ = 3011;
         bindIp_ = "0.0.0.0";
         sock_ = INVALID_SOCK;
-        running_ = false;*/
+        running_ = false;
     }
 
     ~UdpReceiver() {
@@ -98,15 +98,16 @@ public:
             if (inet_pton(AF_INET, bindIp_.c_str(), &addr.sin_addr) != 1) {
                 Logger::getInstance().Log("Invalid bind IP: " + bindIp_);
                 closeSocket();
-                cleanupWinsockIfNeeded();
+                // cleanupWinsockIfNeeded();
                 return false;
             }
         }
 
         if (bind(sock_, (sockaddr*)&addr, sizeof(addr)) != 0) {
             printLastError("bind()");
+            Logger::getInstance().Log("----[UdpReceiver] start() fail to bind udp port!");
             closeSocket();
-            cleanupWinsockIfNeeded();
+            // cleanupWinsockIfNeeded();
             return false;
         }
 
