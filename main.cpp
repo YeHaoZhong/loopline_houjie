@@ -16,7 +16,7 @@ int main(int argc, char *argv[])
     }
 #endif
 
-    SqlConnectionPool::instance().init(30);
+    SqlConnectionPool::instance().init(30);                                         //数据库连接池初始化30个连接
     QApplication a(argc, argv);
     Logger::getInstance().Log("------------------------------------------ window start ------------------------------------------");
     QTranslator translator;

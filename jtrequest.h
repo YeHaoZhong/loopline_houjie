@@ -47,10 +47,8 @@ public:
 
     void requestToken(const QString& account, const QString& password, const QString& appKey, const QString& appSecret);
     void startRefreshIfNeeded();
+    void setOperateType(int type);                                                  //设置进出港
 
-    //void requestUploadingData(const QString& pakageNum, const QString& weight);	//卸车到件扫描
-    //void requestWarehouseScan(const QString& Code);	//入仓扫描
-    //void requestLoadCar(const QString& Code);	//装车发件扫描
 private:
     mutable QMutex m_mutex;
     QNetworkAccessManager* m_netMgr = nullptr;
@@ -67,8 +65,13 @@ private:
     QString m_authToken;                //登录token
     QString m_refreshToken;             //
     QString	m_SortPlanCode;             //格口方案编号
-    QString m_account_;                  //账户(网点)
-    QString m_password_;                 //密码
+    QString m_account_in;                  //账户(网点)，进港
+    QString m_password_in;                 //密码，出港
+    QString m_account_out;                  //出港
+    QString m_password_out;                 //出港
+    int m_operateType = 0;                  //操作模式
+    QString m_account;                      //当前操作账户
+    QString m_password;                     //当前操作密码
     QString m_appKey = "GZJD001231121";
     QString m_appSecret = "kI8gLrUxTSVaRx0ZjhCwkQ==";
 
@@ -92,16 +95,16 @@ private slots:
                           const QString& supply_mac);         //小件回传数据
 
     void requestUploadData(const QString& code, const QString& weight);                         //四合一扫描,补收入发 集散点
-    void requestBuild(const QString& packageNum);                                               //建包接口,所有数据从数据库拿
+    // void requestBuild(const QString& packageNum);                                               //建包接口,所有数据从数据库拿
     void requestBuildOneByOne(const QString& code, const QString& packageNum);                  //建包接口，掉一个建一个
 
     void unloadToPieces(const QString& code, const QString& weight);                            //卸车到件, 进港
-    void outboundScanning(const QString& code);                                                 //出仓扫描， 进港
+    void outboundScanning(const QString& code, const QString& deliveryCode);                    //出仓扫描， 进港
 
 signals:
     void loginSucceeded();
     void loginFailed(const QString& reason);
-    void slotResult(const QString& waybill, int terminalCode, int order_type);
+    void slotResult(const QString& waybill, const std::string& terminalCode, int order_type, int interceptor);              //单号，段码，订单类型，拦截状态
     //通用请求失败回调
     void requestFailed(const QString& url, const QString& reason);
 

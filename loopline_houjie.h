@@ -26,6 +26,8 @@ private:
 private slots:
     void onRunBtnClicked();
     void onStopBtnClicked();
+    void onInOperatorClicked();
+    void onOutOperatorClicked();
 protected:
     void closeEvent(QCloseEvent *event) override
     {

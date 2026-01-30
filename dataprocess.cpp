@@ -24,6 +24,7 @@ DataProcess::DataProcess()                      //开服务,并初始化程序�
             Logger::getInstance().Log("----[DataProcess] DataProcess() Failed to start pda TCP server on port " + std::to_string(m_recvPdaPort));
         }
         connect(m_recvPdaServer, &QtTcpServer::messageReceived, this, &DataProcess::onPdaTCPServerRecv, Qt::QueuedConnection);
+        connect(&m_requestAPI,&JTRequest::slotResult,this, &DataProcess::onTerminalCodeRecv, Qt::QueuedConnection);
         m_supplyIDToOrder.resize(12);                       //初始化每个供包台的序列号
         for(int i = 0; i<12;++i){
             m_supplyIDToOrder[i] = 0;
@@ -41,43 +42,69 @@ DataProcess::DataProcess()                      //开服务,并初始化程序�
                 slotStatusRingDrops.fetch_add(1,std::memory_order_relaxed);
             }
         };
-
+        connect(&m_plc_supplyClient, &SocketClient::dataReceived, this, &DataProcess::onPLCSupplyRecv);
     }
     catch (...) {}
 }
 void DataProcess::dbInit(){
-    auto _sql = SqlConnectionPool::instance().acquire();
-    if(!_sql){
-        Logger::getInstance().Log("----[DataProcess] dbInit() failed to acquire database connection");
-        return;
-    }
-    auto slot_config = _sql->readTable("slot_config");
-    if(!slot_config.empty()){
-        for (const auto& row: slot_config){
-            if(row.size()<1) continue;
-            int slot_id = std::stoi(row[0]);
-            m_slotStatus[slot_id] = 0;                      //初始化格口, 格口都正常
-            m_slotToPackage[slot_id] = "";                  //初始化格口对应的包牌号
+    try{
+        auto _sql = SqlConnectionPool::instance().acquire();
+        if(!_sql){
+            Logger::getInstance().Log("----[DataProcess] dbInit() failed to acquire database connection");
+            return;
         }
-    }
-    auto terminal_to_slot = _sql->readTable("terminal_to_slot");
-    if(!terminal_to_slot.empty()){
-        for(const auto& row:terminal_to_slot){
-            if(row.size()<2) continue;
-            std::string terminal_code = row[0];
-            int slot_id = std::stoi(row[1]);
-            m_terminalCodeToSlot[terminal_code] = slot_id;
+        auto slot_config = _sql->readTable("slot_config");
+        if(!slot_config.empty()){
+            for (const auto& row: slot_config){
+                if(row.size()<1) continue;
+                int slot_id = std::stoi(row[0]);
+                m_slotStatus[slot_id] = 0;                      //初始化格口状态, 格口都正常
+                m_slotToPackage[slot_id] = "";                  //初始化格口对应的包牌号
+            }
         }
-    }
-    m_supplyMacVector.resize(12);
-    auto supply_mac = _sql->readTable("supply_config");
-    if(!supply_mac.empty()){
-        for (const auto& row: supply_mac){
-            if(row.size()<3) continue;
-            int vector_supply_id = std::stoi(row[0]) - 1;
-            m_supplyMacVector[vector_supply_id] = row[2];           //初始化供包台mac地址
+        auto terminal_to_slot_arrival = _sql->readTable("terminal_to_slot_arrival");
+        if(!terminal_to_slot_arrival.empty()){
+            for(const auto& row:terminal_to_slot_arrival){
+                if(row.size()<2) continue;
+                std::string terminal_code = row[0];
+                int slot_id = std::stoi(row[1]);
+                arrival_terminalCodeToSlotMap[terminal_code] = slot_id;
+            }
         }
-    }
+        auto terminal_to_slot_depature = _sql->readTable("terminal_to_slot_depature");
+        if(!terminal_to_slot_depature.empty()){
+            for(const auto& row:terminal_to_slot_depature){
+                if(row.size()<2) continue;
+                std::string terminal_code = row[0];
+                int slot_id = std::stoi(row[1]);
+                depature_terminalCodeToSlotMap[terminal_code] = slot_id;
+            }
+        }
+        m_supplyMacVector.resize(12);
+        auto supply_mac = _sql->readTable("supply_config");
+        if(!supply_mac.empty()){
+            for (const auto& row: supply_mac){
+                if(row.size()<3) continue;
+                int vector_supply_id = std::stoi(row[0]) - 1;
+                m_supplyMacVector[vector_supply_id] = row[2];           //初始化供包台mac地址
+            }
+        }
+        auto slot_to_deliveryCode = _sql->readTable("slot_to_delivery");
+        if(!slot_to_deliveryCode.empty()){
+            for (const auto& row:slot_to_deliveryCode){
+                if(row.size()<2) continue;
+                int slot_id = std::stoi(row[0]);
+                m_slotTodeliveryCodeMap[slot_id] = row[1];              //初始化格口对应的派件员编码， 进港
+            }
+        }
+    }catch(...){}
+}
+void DataProcess::setOperateType(int type){                                             //设置操作模式
+    m_operateType = type;
+    m_requestAPI.setOperateType(m_operateType);
+}
+int DataProcess::getOperateType(){
+    return m_operateType;
 }
 void DataProcess::startSupplyWorker(){                                                  //接收供包信息
     supplyWorkerRunning = true;
@@ -102,14 +129,17 @@ void DataProcess::stopSupplyWorker(){                                           
     supplyWorkerRunning = false;
     if(supplyWorkerThread.joinable()) supplyWorkerThread.join();
 }
-void DataProcess::dataProInit()                             //点击了运行按钮
+void DataProcess::dataProInit()                             //点击运行按钮
 {
-    // connect(&m_plc_supplyClient, &SocketClient::dataReceived, this, &DataProcess::onPLCSupplyRecv);
+
     // connect(&m_plc_sendSlotClient, &SocketClient::dataReceived, this, &DataProcess::onPLCSendSlotRecv);
+
     m_deviceRunning.store(true);
+    isRecvAndSend.store(true);
     tcpConnect();
     startUnloadWorker();                        //接收下件信息线程
     startSlotStatusWorker();                    //接收格口状态线程
+
 }
 void DataProcess::startUnloadWorker(){
     unloadWorkerRunning = true;
@@ -181,6 +211,8 @@ void DataProcess::tcpConnect() {                        //tcp连接
 }
 void DataProcess::tcpDisconnect() {                     //tcp断开连接,即点击了停止按钮
     try {
+        stopUnloadWorker();
+        stopSlotStatusWorker();
         m_deviceRunning.store(false);
         stopTcpCheckThread();
         m_plc_supplyClient.disconnect();
@@ -310,55 +342,123 @@ bool DataProcess::plcRecvSlotStatusTcpConnect(bool destorySock) {
     catch (...) {}
     return false;
 }
-// void DataProcess::onPLCSupplyRecv(const QByteArray& data) {											//plc中的供包信息返回, 用于判断是否已经上传成功, AKD01ID000100000#AKD02ID000100000#
-//     std::string dataStr = data.toStdString();
-//     Logger::getInstance().Log("----[DataProcess] onPLCSupplyRecv() recv data: [" + dataStr + "]");
+void DataProcess::onPLCSupplyRecv(const QByteArray& data) {											//plc中的供包信息返回, 用于判断是否已经上传成功, AKD01ID000100000#AKD02ID000100000#
+    // isRecvAndSend.store(true);
+    std::string dataStr = data.toStdString();
+    Logger::getInstance().Log("----[DataProcess] onPLCSupplyRecv() recv data: [" + dataStr + "]");
 
-// }
-// void DataProcess::onPLCSendSlotRecv(const QByteArray& data) {                                       //plc中的单号格口信息返回
-//     std::string dataStr = data.toStdString();
-//     Logger::getInstance().Log("----[DataProcess] onPLCSendSlotRecv() recv data: [" + dataStr + "]");
-// }
+}
+void DataProcess::onPLCSendSlotRecv(const QByteArray& data) {                                       //plc中的单号格口信息返回
+    std::string dataStr = data.toStdString();
+    Logger::getInstance().Log("----[DataProcess] onPLCSendSlotRecv() recv data: [" + dataStr + "]");
+}
+std::vector<std::string> extract_by_split(const std::string &s) {                                   //切割字符串GKD01ID0001G1001#GKD02ID0001G1020#SU213D04ID0001G2008
+    std::vector<std::string> results;
+    size_t start = 0;
+    while (start < s.size()) {
+        size_t hash = s.find('#', start);
+        if (hash == std::string::npos) hash = s.size();
+        if (hash > start) {
+            std::string seg = s.substr(start, hash - start); // e.g. "GKD01ID0001G1001"
+            size_t posD = seg.find('D');                      // 找 D 的位置
+            if (posD != std::string::npos) {
+                // 找 D 后面的下一个 'G'（若无则取到段尾）
+                size_t posNextG = seg.find('G', posD + 1);
+                size_t len = (posNextG == std::string::npos) ? seg.size() - posD : posNextG - posD;
+                results.push_back(seg.substr(posD, len));
+            }
+        }
+        start = hash + 1;
+    }
+    return results;
+}
 void DataProcess::onPLCUnLoadRecv(const QByteArray& data) {                                             //plc中的下件发送,SU代表正常下件, FA代表未成功并且需要删除该包裹的集包记录
     try{
         std::string dataStr = data.toStdString();
         Logger::getInstance().Log("----[DataProcess] onPLCUnLoadRecv() recv data: [" + dataStr + "]");
-        std::string id_msg = "";                                                                        //供包台号以及序列号
-        int supply_id = -1;                                                                             //从消息中获取供包台号
-        if(supply_id<1||supply_id>12) supply_id = 1;
-        std::string supply_mac = m_supplyMacVector[supply_id - 1];
-        if(dataStr.find(unload_fail) == std::string::npos){                                             //下件成功, 进行集包请求
-            const std::string& code = m_msgToCodeMap[id_msg];                                           //获取单号
-            auto _sql = SqlConnectionPool::instance().acquire();
-            std::string weight = "0.5";                                                                 //初始化重量
-            if(_sql){
-                auto db_weight = _sql->queryString("supply_data","code",code,"weight");
-                if(db_weight)
+        sendUnloadRecvToPLC(dataStr);
+        QtConcurrent::run([this,dataStr]() {                                 //异步执行
+            auto msgs = extract_by_split(dataStr);                                                              //切割字符串得到序列号
+            for(auto &msg : msgs){
+                int supply_id = -1;                                                                             //从消息中获取供包台号
+                if(msg.size()>=3 && msg[0] == 'D'){
+                    std::string num = msg.substr(1,2);
+                    supply_id = std::stoi(num);
+                }
+                if(supply_id<1||supply_id>12) return;
+                std::string supply_mac = m_supplyMacVector[supply_id - 1];
+                auto it = m_msgToCodeMap.find(msg);
+                if(it!=m_msgToCodeMap.end())
                 {
-                    weight = *db_weight;
+                    const std::string& code = m_msgToCodeMap[msg];                                              //获取单号
+                    //清除队列中存储的序列号与单号的键值对
+                    auto _sql = SqlConnectionPool::instance().acquire();
+                    std::string weight = "0.5";                                                                 //初始化重量
+                    if(_sql){
+                        auto db_weight = _sql->queryString("supply_data","code",code,"weight");
+                        if(db_weight)
+                        {
+                            weight = *db_weight;
+                        }
+                    }
+
+                    // int slot_id = m_codeToSlotMap[code];                                                        //获取格口号
+                    int slot_id = -1;
+                    auto slot_id_map = m_codeToSlotMap.find(code);
+                    if(slot_id_map!=m_codeToSlotMap.end()){                                                     //存在列表中
+                        slot_id = slot_id_map->second;
+                        m_codeToSlotMap.erase(code);                                                            //清除队列中单号与格口号的键值对
+                    }
+                    else{                                                                                       //队列中不存在
+                        if(_sql){
+                            auto db_slot_id = _sql->queryString("supply_data","code",code,"slot_id");
+                            if(db_slot_id){
+                                slot_id = std::stoi(*db_slot_id);
+                            }
+                        }
+                    }
+                    if(m_operateType == 1)                                                                      //进港,不需要集包，只需要出仓扫描
+                    {
+                        auto it = m_slotTodeliveryCodeMap.find(slot_id);
+                        if(it!=m_slotTodeliveryCodeMap.end()){
+                            const std::string& deliveryCode = it->second;
+                            QMetaObject::invokeMethod(&m_requestAPI,                                                    //出仓扫描
+                                                      "outboundScanning",
+                                                      Qt::QueuedConnection,
+                                                      Q_ARG(QString, QString::fromStdString(code)), Q_ARG(QString, QString::fromStdString(deliveryCode)));
+                        }
+                    }
+                    else if(m_operateType == 2){                                                                        //出港，需要集包
+                        auto _it = m_slotToPackage.find(slot_id);
+                        if(_it!=m_slotToPackage.end()){
+                            const std::string& packageNum = _it->second;                                                //获取包牌号
+                            QMetaObject::invokeMethod(&m_requestAPI,                                                    //建包
+                                                      "requestBuildOneByOne",
+                                                      Qt::QueuedConnection,
+                                                      Q_ARG(QString, QString::fromStdString(code)), Q_ARG(QString, QString::fromStdString(packageNum)));
+                        }
+                    }
+                    QMetaObject::invokeMethod(&m_requestAPI,                                                    //小件回传，进出港都需要
+                                              "requestSmallData",
+                                              Qt::QueuedConnection,
+                                              Q_ARG(QString,QString::fromStdString(code)),
+                                              Q_ARG(QString,QString::fromStdString(weight)),
+                                              Q_ARG(int,m_operateType),
+                                              Q_ARG(int, slot_id),
+                                              Q_ARG(int, supply_id),
+                                              Q_ARG(QString,QString::fromStdString(supply_mac)));
+                    m_msgToCodeMap.erase(msg);
                 }
             }
-            int slot_id = m_codeToSlotMap[code];                                                        //获取格口号
-            const std::string& packageNum = m_slotToPackage[slot_id];                                   //获取包牌号
-            QMetaObject::invokeMethod(&m_requestAPI,                                                    //建包
-                                      "requestBuildOneByOne",
-                                      Qt::QueuedConnection,
-                                      Q_ARG(QString, QString::fromStdString(code)), Q_ARG(QString, QString::fromStdString(packageNum)));
-            QMetaObject::invokeMethod(&m_requestAPI,                                                    //小件回传
-                                      "requestSmallData",
-                                      Qt::QueuedConnection,
-                                      Q_ARG(QString,QString::fromStdString(code)),Q_ARG(QString,QString::fromStdString(weight)),Q_ARG(int,m_operateType),Q_ARG(int, slot_id));
-        }
+        });
+                                                                                //发送回复消息
     }
     catch(...){}
 }
-void DataProcess::onPLCSlotStatusRecv(const QByteArray& data) {                                     //plc中的格口状态返回, 用于判断pda巴枪绑定包牌
+void DataProcess::onPLCSlotStatusRecv(const QByteArray& data) {                                     //plc中的格口状态返回, 把格口号对应的包号置为空
     try{
         std::string dataStr = data.toStdString();
         Logger::getInstance().Log("----[DataProcess] onPLCSlotStatusRecv() recv data: [" + dataStr + "]");
-        if(dataStr.find("SK") !=std::string::npos){                                                 //格口信息, 需要实际查看
-
-        }
     }
     catch(...){}
 }
@@ -377,9 +477,10 @@ void DataProcess::onSupplyUDPServerRecv(const std::string& message) {							//�
             << "ID"
             << std::setw(4) << std::setfill('0') << supply_order;
         std::string order_msg = oss.str();
-        m_msgToCodeMap[order_msg] = code;                                                                   //写入队列中
-        sendSupplyDataToPLC(supply_id,supply_order);
+        m_msgToCodeMap[order_msg] = code;                                                                   //写入队列中，序列号对应单号
+        m_codeToMsgMap[code] = order_msg;                                                                   //单号对应序列号
         QtConcurrent::run([this, code, weight, supply_id, supply_order]() {                                 //异步执行
+            sendSupplyDataToPLC(supply_id,supply_order);
             int slot_id = insertSupplyDataToDB(code, weight, supply_id, supply_order);
             requestAndSendToPLC(code, weight, slot_id);
         });
@@ -389,25 +490,37 @@ void DataProcess::onSupplyUDPServerRecv(const std::string& message) {							//�
 void DataProcess::requestAndSendToPLC(const std::string& code,const std::string& weight, int slot_id){            //若没请求一段码则进行请求, 若请求过则发送到plc中, 需要判断是进港还是出港
     try{
         if(m_operateType == 1){                                                 //进港
-            if(slot_id<=0){
-                QMetaObject::invokeMethod(&m_requestAPI,
-                                          "unloadToPieces",                     //卸车到件
-                                          Qt::QueuedConnection,
-                                          Q_ARG(QString, QString::fromStdString(code))
-                                          );
+            if(slot_id<=0){                                                     //格口未请求
                 QMetaObject::invokeMethod(&m_requestAPI,
                                           "requestTerminalCode",                //一段码
                                           Qt::QueuedConnection,
                                           Q_ARG(QString, QString::fromStdString(code))
                                           );
+            }else{                                                               //已请求, 发送至plc
+                m_codeToSlotMap[code] = slot_id;                                    //写入队列
+
+                auto it = m_codeToMsgMap.find(code);
+                if(it!=m_codeToMsgMap.end()){
+                    const std::string& order_msg = it->second;
+                    sendSlotToPLC(code,order_msg,slot_id);
+                    m_codeToMsgMap.erase(code);
+                }else{
+                    sendSlotToPLC(code,"",slot_id);
+                }
             }
+            QMetaObject::invokeMethod(&m_requestAPI,
+                                      "unloadToPieces",                     //卸车到件
+                                      Qt::QueuedConnection,
+                                      Q_ARG(QString, QString::fromStdString(code)),
+                                      Q_ARG(QString, QString::fromStdString(weight))
+                                      );
         }else if(m_operateType == 2){                                           //出港
+            QMetaObject::invokeMethod(&m_requestAPI,
+                                      "requestUploadData",                  //四合一
+                                      Qt::QueuedConnection,
+                                      Q_ARG(QString, QString::fromStdString(code)), Q_ARG(QString, QString::fromStdString(weight))
+                                      );
             if(slot_id<=0){                                                     //未请求,进行请求
-                QMetaObject::invokeMethod(&m_requestAPI,
-                                          "requestUploadData",                  //四合一
-                                          Qt::QueuedConnection,
-                                          Q_ARG(QString, QString::fromStdString(code)), Q_ARG(QString, QString::fromStdString(weight))
-                                          );
                 QMetaObject::invokeMethod(&m_requestAPI,
                                           "requestTerminalCode",                //一段码
                                           Qt::QueuedConnection,
@@ -415,7 +528,15 @@ void DataProcess::requestAndSendToPLC(const std::string& code,const std::string&
                                           );
             }
             else{                                                               //已请求, 发送至plc
-                sendSlotToPLC(code,slot_id);
+                m_codeToSlotMap[code] = slot_id;                                //写入队列, 供onPLCUnLoadRecv 寻找格口号使用
+                auto it = m_codeToMsgMap.find(code);
+                if(it!=m_codeToMsgMap.end()){
+                    const std::string& order_msg = it->second;
+                    sendSlotToPLC(code,order_msg,slot_id);
+                    m_codeToMsgMap.erase(code);
+                }else{
+                    sendSlotToPLC(code,"",slot_id);
+                }
             }
         }
     }
@@ -433,7 +554,7 @@ int DataProcess::updateSupplyOrder(int supply_id){                              
     m_supplyIDToOrder[supply_id_vector] = supply_order;
     return supply_order;
 }
-std::string DataProcess::takeMsgFromPLCSupplyQueue(size_t n) {                              //从待供包队列中提取最多五个并删除
+std::string DataProcess::takeMsgFromPLCSendSlotQueue(size_t n) {                              //从待发送格口队列中提取最多五个并删除
     std::string msg = "";
     try{
         size_t _n = std::min(n, m_sendPLCSlotDataQueue.size());
@@ -445,20 +566,22 @@ std::string DataProcess::takeMsgFromPLCSupplyQueue(size_t n) {                  
     }catch(...){}
     return msg;
 }
-std::string DataProcess::takeMsgFromPLCSendSlotQueue(size_t n) {                            //从待发送格口队列中提取最多五个并删除
+
+std::string DataProcess::takeMsgFromPLCSupplyQueue(size_t n) {                                  //从待供包队列中提取最多五个并删除
     std::string msg = "";
     try{
         size_t _n = std::min(n, m_sendPLCSupplyDataQueue.size());
         for (size_t i = 0; i < _n; ++i) {
             std::string message = std::move(m_sendPLCSupplyDataQueue.front());
             msg += message + "#";
-            m_haveSentPLCSupplyDataQueue.push_back(message);
+            Logger::getInstance().Log("----[test] message : ["+msg+"]");
             m_sendPLCSupplyDataQueue.pop_front();
         }
+        return msg;
     }catch(...){}
-    return msg;
+    return "0000000000000000";
 }
-int DataProcess::insertSupplyDataToDB(const std::string& code, const std::string weight, int supply_id, int supply_order){              //上件单号插入数据库, 返回格口号
+int DataProcess::insertSupplyDataToDB(const std::string& code, const std::string& weight, int supply_id, int supply_order){              //上件单号插入数据库, 返回格口号
     int slot_id = -1;
     std::string now_time = getCurrentTime();
     try{
@@ -493,7 +616,7 @@ int DataProcess::insertSupplyDataToDB(const std::string& code, const std::string
                 Logger::getInstance().Log("----[DataProcess] insertSupplyDataToDB() update row failed! code: ["+code+"]");
             }
         }
-        else{                                                                       //未写入, 写入数据库
+        else{                                                                                           //未写入, 写入数据库
             const std::vector<std::string> value = {code,
                                                     weight,
                                                     now_time,
@@ -510,6 +633,81 @@ int DataProcess::insertSupplyDataToDB(const std::string& code, const std::string
         }
     }catch(...){}
     return slot_id;
+}
+void DataProcess::onTerminalCodeRecv(const QString& code, const std::string& terminalCode, int order_type, int interceptor){             //接收到格口信息,发送给plc， 同时写入数据库
+    try{
+        std::string code_copy = code.toStdString();
+        int slot_id = -1;
+        Logger::getInstance().Log("----[DataProcess] onTerminalCodeRecv() operate type:["+std::to_string(m_operateType)
+                                  +"],code,["+code_copy
+                                  +"],terminal_code:["+terminalCode
+                                  +"],order_type:["+std::to_string(order_type)+"]");
+        if(interceptor == 2)                                                            //不是拦截件，是否拦截件，1-是 2-否
+        {
+            if(order_type == 1)                                                       //正常件,发送对应格口号至plc中
+            {
+                if(m_operateType == 1)                                                  //进港
+                {
+                    auto it = arrival_terminalCodeToSlotMap.find(terminalCode);                     //查找map中的格口号， 并写入数据库
+                    if(it!=arrival_terminalCodeToSlotMap.end()){
+                        slot_id = it->second;
+                    }
+                    else{
+                        slot_id = arrival_terminalCodeToSlotMap["异常格"];
+                    }
+                }
+                else{                                                                   //出港
+                    auto it = depature_terminalCodeToSlotMap.find(terminalCode);
+                    if(it!=depature_terminalCodeToSlotMap.end()){
+                        slot_id = it->second;
+                    }
+                    else{
+                        slot_id = depature_terminalCodeToSlotMap["异常格"];
+                    }
+                }
+
+            }else{                                                                      //异常件,发送异常格口至plc中
+                if(m_operateType == 1)                                                  //进港
+                {
+                    slot_id = arrival_terminalCodeToSlotMap["异常格"];
+                }
+                else                                                                    //出港
+                {
+                    slot_id = depature_terminalCodeToSlotMap["异常格"];
+                }
+            }
+        }
+        else if(interceptor == 1)                                                       //拦截
+        {
+            if(m_operateType == 1) slot_id = arrival_terminalCodeToSlotMap["拦截件"];
+            else slot_id = depature_terminalCodeToSlotMap["拦截件"];
+        }
+        m_codeToSlotMap[code_copy] = slot_id;                                               //写入队列，单号对应的格口号
+        auto _it = m_codeToMsgMap.find(code_copy);
+        if(_it!=m_codeToMsgMap.end()){
+            const std::string& order_msg = _it->second;
+            sendSlotToPLC(code_copy, order_msg, slot_id);
+            m_codeToMsgMap.erase(code_copy);                                                //清除队列中存储的单号与序列号键值对
+        }
+        else{
+            sendSlotToPLC(code_copy,"",slot_id);
+        }
+        QtConcurrent::run([this, code_copy,slot_id]() {                                     //异步执行,写入数据库
+            auto _sql = SqlConnectionPool::instance().acquire();
+            if(_sql){
+                _sql->updateValue("supply_data","code",code_copy,"slot_id",std::to_string(slot_id));
+            }
+        });
+    }catch(...){}
+}
+void DataProcess::sendUnloadRecvToPLC(const std::string& data){
+    try{
+        if(m_plcUnloadMutex.try_lock()){
+            m_plc_unloadClient.sendData(data);
+            m_plcUnloadMutex.unlock();
+            Logger::getInstance().Log("----[DataProcess] sendUnloadRecvToPLC() send message: ["+data+"]");
+        }
+    }catch(...){}
 }
 void DataProcess::sendSupplyDataToPLC(int supply_id, int supply_order) {                            //STD+供包台+ID+供包台序列号+00000
     try{
@@ -528,11 +726,11 @@ void DataProcess::sendSupplyDataToPLC(int supply_id, int supply_order) {        
             << "00000";
         std::string message = oss.str();
         if (m_sendPLCSupplyDataQueue.size() == 0) {					//队列为空, 直接发送
-            m_haveSentPLCSupplyDataQueue.push_back(message);
             send_msg = message + "#";
             if (m_plcSupplyMutex.try_lock()) {						//直接发送
                 m_plc_supplyClient.sendData(send_msg);
                 m_plcSupplyMutex.unlock();
+                Logger::getInstance().Log("----[DataProcess] sendSupplyDataToPLC() send message: ["+send_msg+"]");
             }
             else {													//存储到队列中, 下次发送
                 m_sendPLCSupplyDataQueue.push_back(message);
@@ -546,34 +744,44 @@ void DataProcess::sendSupplyDataToPLC(int supply_id, int supply_order) {        
                 send_msg = takeMsgFromPLCSupplyQueue(5);				//每次最多发送5条
                 m_plc_supplyClient.sendData(send_msg);
                 m_plcSupplyMutex.unlock();
+                Logger::getInstance().Log("----[DataProcess] sendSupplyDataToPLC() send message: ["+send_msg+"]");
             }
             else{
                 Logger::getInstance().Log("----[DataProcess] sendSupplyDataToPLC() store m_sendPLCSupplyDataQueue data: ["+message+"]");
                 return;
             }
         }
-        Logger::getInstance().Log("----[DataProcess] sendSupplyDataToPLC() send message: ["+send_msg+"]");
+
     }catch(...){}
 }
-void DataProcess::sendSlotToPLC(const std::string code, int slot_id){                           //发送格口信息给plc
+void DataProcess::sendSlotToPLC(const std::string& code, const std::string& order_msg, int slot_id){                           //发送格口信息给plc
     try{
-        int supply_id = -1;
-        int supply_order = -1;
-
-        auto _mysql = SqlConnectionPool::instance().acquire();
-        if(!_mysql){
-            Logger::getInstance().Log("----[DataProcess] sendSlotToPLC() sql pool no free connect!");
-            return;
+        std::string send_msg = "";
+        std::string message = "";
+        if(order_msg != ""){                    //有现成序列号
+            std::ostringstream oss;
+            oss << "GK"
+                << order_msg
+                << "G"
+                << std::to_string(slot_id);
+            message = oss.str();
         }
-        auto query_id = _mysql->queryString("supply_data","code",code,"supply_id");
-        if(query_id){
-            supply_id = std::stoi(*query_id);
-        }
-        auto query_order = _mysql->queryString("supply_data","code",code,"supply_order");
-        if(query_order){
-            supply_order = std::stoi(*query_order);
-        }
-        if(supply_id!=-1 &&supply_order!=-1){       //发送plc格口信息
+        else{                                   //若没有， 使用数据库中序列号
+            int supply_id = -1;
+            int supply_order = -1;
+            auto _mysql = SqlConnectionPool::instance().acquire();
+            if(!_mysql){
+                Logger::getInstance().Log("----[DataProcess] sendSlotToPLC() sql pool no free connect!");
+                return;
+            }
+            auto query_id = _mysql->queryString("supply_data","code",code,"supply_id");
+            if(query_id){
+                supply_id = std::stoi(*query_id);
+            }
+            auto query_order = _mysql->queryString("supply_data","code",code,"supply_order");
+            if(query_order){
+                supply_order = std::stoi(*query_order);
+            }
             std::string supply_idStr = std::to_string(supply_id);
             std::string supply_orderStr = std::to_string(supply_order);
             std::string send_msg = "";
@@ -584,50 +792,97 @@ void DataProcess::sendSlotToPLC(const std::string code, int slot_id){           
                 << std::setw(4) << std::setfill('0') << supply_order
                 << "G"
                 << std::to_string(slot_id);                                             //
-            std::string message = oss.str();
-            if(m_sendPLCSlotDataQueue.size() == 0){                                     //队列为空
-                if(m_plcSendSlotMutex.try_lock()){                                      //直接发送
-                    send_msg = message+"#";
-                    m_plc_sendSlotClient.sendData(send_msg);
-                    m_plcSendSlotMutex.unlock();
-                }
-                else{                                                                   //写入到队列中
-                    m_sendPLCSlotDataQueue.push_back(message);
-                    Logger::getInstance().Log("----[DataProcess] sendSlotToPLC() store m_sendPLCSlotDataQueue data: ["+message+"]");
-                    return;
-                }
+            message = oss.str();
+        }
+        if(m_sendPLCSlotDataQueue.size() == 0){                                     //队列为空
+            if(m_plcSendSlotMutex.try_lock()){                                      //直接发送
+                send_msg = message+"#";
+                m_plc_sendSlotClient.sendData(send_msg);
+                m_plcSendSlotMutex.unlock();
+            }
+            else{                                                                   //写入到队列中
+                m_sendPLCSlotDataQueue.push_back(message);
+                Logger::getInstance().Log("----[DataProcess] sendSlotToPLC() store m_sendPLCSlotDataQueue data: ["+message+"]");
+                return;
+            }
+        }
+        else{
+            m_sendPLCSlotDataQueue.push_back(message);
+            if(m_plcSendSlotMutex.try_lock()){
+                send_msg = takeMsgFromPLCSendSlotQueue(5);
+                m_plc_sendSlotClient.sendData(send_msg);
+                m_plcSendSlotMutex.unlock();
             }
             else{
-                m_sendPLCSlotDataQueue.push_back(message);
-                if(m_plcSendSlotMutex.try_lock()){
-                    send_msg = takeMsgFromPLCSendSlotQueue(5);
-                    m_plc_sendSlotClient.sendData(send_msg);
-                    m_plcSendSlotMutex.unlock();
-                }
-                else{
-                    Logger::getInstance().Log("----[DataProcess] sendSlotToPLC() store m_sendPLCSlotDataQueue data: ["+message+"]");
-                    return;
-                }
+                Logger::getInstance().Log("----[DataProcess] sendSlotToPLC() store m_sendPLCSlotDataQueue data: ["+message+"]");
+                return;
             }
-            Logger::getInstance().Log("----[DataProcess] sendSupplyDataToPLC() send message: ["+send_msg+"]");
         }
+        Logger::getInstance().Log("----[DataProcess] sendSlotToPLC() send message: ["+send_msg+"]");
     }
     catch(...){}
 }
+
+static inline void ltrim(std::string &s) {
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch){ return !std::isspace(ch); }));
+}
+static inline void rtrim(std::string &s) {
+    s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch){ return !std::isspace(ch); }).base(), s.end());
+}
+static inline void trim(std::string &s) { ltrim(s); rtrim(s); }
+
+/*
+ * 解析函数：
+ * 返回 true 表示解析成功，out_code/out_area 会被填充。
+ * 返回 false 表示解析失败（格式不符合预期）。
+ */
+bool parse_cb_line(const std::string &input, std::string &out_code, std::string &out_area) {
+    out_code.clear();
+    out_area.clear();
+
+    // 找到第一个 ':'（例如 CB-1:...）
+    size_t pos = input.find(':');
+    if (pos == std::string::npos) return false;
+
+    // 取 ':' 之后的子串
+    size_t start = pos + 1;
+    if (start >= input.size()) return false;
+
+    // 第一个字段到第一个逗号
+    size_t comma1 = input.find(',', start);
+    if (comma1 == std::string::npos) return false;
+    out_code = input.substr(start, comma1 - start);
+    trim(out_code);
+
+    // 第二个字段（逗号1之后到逗号2）
+    size_t next = comma1 + 1;
+    size_t comma2 = input.find(',', next);
+    if (comma2 == std::string::npos) {
+        // 如果没有第二个逗号，就取到末尾
+        out_area = input.substr(next);
+    } else {
+        out_area = input.substr(next, comma2 - next);
+    }
+    trim(out_area);
+
+    // 简单校验非空
+    return !out_code.empty() && !out_area.empty();
+}
 void DataProcess::onPdaTCPServerRecv(int clientId, const QString& message) {                        //接收pda巴枪, 需要测试pda巴枪数据,使用connect信号槽
     try {
-        int slot_id = -1;
+        std::string slot_id = "";
         std::string new_package = "";
         std::string msgStr = message.toStdString();
         Logger::getInstance().Log("----[DataProcess] onPdaTCPServerRecv() clientId: " + std::to_string(clientId) + ", message: [" + msgStr + "]");
-        if(!m_deviceRunning.load())                                                                 //线体停止状态
+        if(!m_deviceRunning.load())                                                                 //运行为停止状态
         {
             return;
         }
-        //m_slotToPackage
-        if(m_slotStatus[slot_id] == 1)                                                              //锁格状态
+        if(parse_cb_line(msgStr,new_package,slot_id))                                               //解析成功
         {
-            m_slotToPackage[slot_id] = new_package;                                                 //更新包牌号码
+            int slot_id_int = std::stoi(slot_id);
+            m_slotToPackage[slot_id_int] = new_package;
+
         }
     }
     catch (...) {}
