@@ -1,0 +1,4 @@
+pyftpdlib>=1.5.6
+mysql-connector-python>=8.0
+pillow>=9.0
+requests>=2.28

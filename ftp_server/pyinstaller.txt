@@ -1,0 +1,1 @@
+pyinstaller --paths src .\src\main.py --hidden-import=mysql.connector.plugins.mysql_native_password --hidden-import=mysql.connector.locales.eng.client_error
